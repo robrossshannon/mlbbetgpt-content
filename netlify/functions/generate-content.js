@@ -277,12 +277,14 @@ async function scheduleToBuffer(parsed, scheduleTime) {
   const mutation = `
     mutation CreatePost($input: CreatePostInput!) {
       createPost(input: $input) {
-        post {
-          id
-          status
-          scheduledAt
+        ... on PostActionSuccess {
+          post {
+            id
+            status
+            dueAt
+          }
         }
-        errors {
+        ... on MutationError {
           message
         }
       }
@@ -293,8 +295,11 @@ async function scheduleToBuffer(parsed, scheduleTime) {
     const variables = {
       input: {
         channelId,
-        content: { text: parsed.caption },
-        scheduledAt: scheduleTime
+        text: parsed.caption,
+        schedulingType: 'automatic',
+        mode: 'customScheduled',
+        dueAt: scheduleTime,
+        assets: []
       }
     };
 
@@ -308,14 +313,17 @@ async function scheduleToBuffer(parsed, scheduleTime) {
     });
 
     const data = await res.json();
+    console.log(`Buffer response for channel ${channelId}:`, JSON.stringify(data));
 
     if (data.errors) {
-      console.error(`Buffer error for channel ${channelId}:`, JSON.stringify(data.errors));
-    } else if (data.data?.createPost?.errors?.length) {
-      console.error(`Buffer createPost errors:`, JSON.stringify(data.data.createPost.errors));
+      console.error(`Buffer GraphQL error for channel ${channelId}:`, JSON.stringify(data.errors));
     } else {
-      const post = data.data?.createPost?.post;
-      console.log(`Scheduled to ${channelId}:`, post?.id, 'at', post?.scheduledAt);
+      const result = data.data?.createPost;
+      if (result?.post) {
+        console.log(`Scheduled to ${channelId}: post ${result.post.id} at ${result.post.dueAt}`);
+      } else if (result?.message) {
+        console.error(`Buffer createPost error:`, result.message);
+      }
     }
   }
 }
