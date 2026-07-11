@@ -1,6 +1,5 @@
 [build]
   functions = "netlify/functions"
 
-# Run content generation every day at 9am ET (2pm UTC)
 [functions."generate-content"]
   schedule = "0 14 * * *"
