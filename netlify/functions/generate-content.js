@@ -6,16 +6,20 @@
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
-const APPROVAL_EMAIL = 'robrossshannon.betgpt@gmail.com';
-const APPROVE_URL = process.env.SITE_URL + '/api/approve-post';
+const BUFFER_API_KEY = process.env.BUFFER_API_KEY;
+
+const INSTAGRAM_CHANNEL_ID = '6a5297ba404834462896cabf';
+const TIKTOK_CHANNEL_ID = '6a5297ce404834462896cb0f';
+
+// Posts at 6pm ET (11pm UTC) daily
+const POST_HOUR_UTC = 23;
 
 exports.handler = async function(event) {
   try {
     console.log('Starting daily content generation...');
     const today = new Date().toISOString().split('T')[0];
 
-    // 1. Fetch tonight's games + starters from MLB API
+    // 1. Fetch tonight's games + starters
     const games = await fetchTonightsGames(today);
     if (!games.length) {
       console.log('No games today, skipping.');
@@ -28,22 +32,32 @@ exports.handler = async function(event) {
     // 3. Fetch Baseball Savant stats for each starting pitcher
     const savantData = await fetchSavantStats(games);
 
-    // 4. Build context and generate post via Claude
+    // 4. Build context string and generate post via Claude
     const context = buildContext(games, odds, savantData, today);
     const post = await generatePost(context);
 
-    // 5. Store post in Netlify Blobs for approval/retrieval
-    await storePost(post, today);
+    // 5. Parse the post into sections
+    const parsed = parsePost(post);
+    console.log('Generated post hook:', parsed.hook);
 
-    // 6. Email for approval
-    await sendApprovalEmail(post, today);
+    // 6. Schedule to Buffer (Instagram + TikTok)
+    const scheduleTime = getScheduleTime();
+    await scheduleToBuffer(parsed, scheduleTime);
 
-    console.log('Content generation complete!');
-    return { statusCode: 200, body: JSON.stringify({ success: true, post }) };
+    console.log('Content scheduled for', scheduleTime);
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify({ success: true, post: parsed, scheduledFor: scheduleTime })
+    };
 
   } catch(err) {
     console.error('Content generation error:', err);
-    return { statusCode: 500, body: JSON.stringify({ error: err.message }) };
+    return {
+      statusCode: 500,
+      headers: { 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify({ error: err.message })
+    };
   }
 };
 
@@ -88,46 +102,42 @@ async function fetchOdds() {
 
 // ── FETCH BASEBALL SAVANT STATS ──
 async function fetchSavantStats(games) {
-  const pitcherIds = [];
+  const pitchers = [];
   games.forEach(g => {
-    if (g.away.pitcher) pitcherIds.push({ id: g.away.pitcher.id, name: g.away.pitcher.name });
-    if (g.home.pitcher) pitcherIds.push({ id: g.home.pitcher.id, name: g.home.pitcher.name });
+    if (g.away.pitcher) pitchers.push(g.away.pitcher);
+    if (g.home.pitcher) pitchers.push(g.home.pitcher);
   });
 
   const stats = {};
-  const currentYear = new Date().getFullYear();
+  const year = new Date().getFullYear();
 
-  await Promise.all(pitcherIds.map(async (pitcher) => {
+  await Promise.all(pitchers.map(async (pitcher) => {
     try {
-      // Baseball Savant pitcher leaderboard CSV endpoint — free, no key needed
-      const url = `https://baseballsavant.mlb.com/statcast_search/csv?hfPT=&hfAB=&hfGT=R%7C&hfPR=&hfZ=&stadium=&hfBBL=&hfNewZones=&hfPull=&hfC=&hfSea=${currentYear}%7C&hfSit=&player_type=pitcher&hfOuts=&opponent=&pitcher_throws=&batter_stands=&hfSA=&game_date_gt=&game_date_lt=&hfInfield=&team=&position=&hfOutfield=&hfRO=&home_road=&hfFlag=&hfBBT=&metric_1=&hfInn=&min_pitches=0&min_results=0&group_by=name&sort_col=pitches&player_event_sort=api_p_release_speed&sort_order=desc&min_abs=0&type=details&player_id=${pitcher.id}`;
-
+      const url = `https://baseballsavant.mlb.com/statcast_search/csv?player_type=pitcher&hfSea=${year}%7C&player_id=${pitcher.id}&group_by=name&sort_col=pitches&sort_order=desc&type=details&min_pitches=0&min_results=0&min_abs=0`;
       const res = await fetch(url, {
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MLBBetGPT/1.0)' }
       });
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const csv = await res.text();
-      const parsed = parseCSV(csv);
+      const rows = parseCSV(csv);
 
-      if (parsed.length > 0) {
-        // Aggregate key metrics from pitch-level data
-        const pitches = parsed;
-        const totalPitches = pitches.length;
-        const swingMiss = pitches.filter(p => p.description === 'swinging_strike' || p.description === 'swinging_strike_blocked').length;
-        const hardHit = pitches.filter(p => parseFloat(p.launch_speed) >= 95).length;
-        const inPlay = pitches.filter(p => p.type === 'X').length;
+      if (rows.length > 0) {
+        const swings = rows.filter(r => ['swinging_strike','swinging_strike_blocked','foul','hit_into_play','foul_tip'].includes(r.description)).length;
+        const whiffs = rows.filter(r => ['swinging_strike','swinging_strike_blocked'].includes(r.description)).length;
+        const inPlay = rows.filter(r => r.type === 'X').length;
+        const hardHit = rows.filter(r => parseFloat(r.launch_speed) >= 95).length;
+        const velos = rows.map(r => parseFloat(r.release_speed)).filter(v => !isNaN(v) && v > 0);
 
         stats[pitcher.id] = {
           name: pitcher.name,
-          totalPitches,
-          whiffPct: totalPitches > 0 ? ((swingMiss / totalPitches) * 100).toFixed(1) : null,
-          hardHitPct: inPlay > 0 ? ((hardHit / inPlay) * 100).toFixed(1) : null,
-          avgVelo: avg(pitches.map(p => parseFloat(p.release_speed)).filter(v => !isNaN(v))).toFixed(1)
+          whiffPct: swings > 0 ? ((whiffs / swings) * 100).toFixed(1) : 'N/A',
+          hardHitPct: inPlay > 0 ? ((hardHit / inPlay) * 100).toFixed(1) : 'N/A',
+          avgVelo: velos.length > 0 ? (velos.reduce((a,b) => a+b, 0) / velos.length).toFixed(1) : 'N/A',
+          pitches: rows.length
         };
       }
     } catch(e) {
-      console.error(`Savant fetch error for ${pitcher.name}:`, e.message);
+      console.error(`Savant error for ${pitcher.name}:`, e.message);
       stats[pitcher.id] = null;
     }
   }));
@@ -135,41 +145,47 @@ async function fetchSavantStats(games) {
   return stats;
 }
 
-// ── BUILD CONTEXT STRING ──
+// ── BUILD CONTEXT ──
 function buildContext(games, odds, savantData, date) {
-  const dateStr = new Date(date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-  let ctx = `DATE: ${dateStr}\n\nTONIGHT'S MLB GAMES WITH ANALYTICS:\n\n`;
+  const dateStr = new Date(date + 'T12:00:00Z').toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric'
+  });
+  let ctx = `DATE: ${dateStr}\n\nTONIGHT'S MLB GAMES:\n\n`;
 
-  games.forEach(g => {
-    const gameTime = new Date(g.time).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+  games.slice(0, 8).forEach(g => {
+    const gameTime = new Date(g.time).toLocaleTimeString('en-US', {
+      hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
+    });
     ctx += `${g.away.team} @ ${g.home.team} (${gameTime})\n`;
 
-    // Add odds
-    const gameOdds = odds.find(o =>
-      o.away_team.includes(g.away.team?.split(' ').pop()) ||
-      o.home_team.includes(g.home.team?.split(' ').pop())
+    // Odds
+    const gameOdds = (Array.isArray(odds) ? odds : []).find(o =>
+      o.away_team && g.away.team && (
+        o.away_team.includes(g.away.team.split(' ').pop()) ||
+        g.away.team.includes(o.away_team.split(' ').pop())
+      )
     );
     if (gameOdds) {
       const h2h = gameOdds.bookmakers?.[0]?.markets?.find(m => m.key === 'h2h');
       const total = gameOdds.bookmakers?.[0]?.markets?.find(m => m.key === 'totals');
       if (h2h) {
-        const awayOdds = h2h.outcomes.find(o => o.name === gameOdds.away_team)?.price;
-        const homeOdds = h2h.outcomes.find(o => o.name === gameOdds.home_team)?.price;
-        ctx += `  Moneyline: ${g.away.team} ${awayOdds > 0 ? '+' : ''}${awayOdds} | ${g.home.team} ${homeOdds > 0 ? '+' : ''}${homeOdds}\n`;
+        const ao = h2h.outcomes.find(o => o.name === gameOdds.away_team)?.price;
+        const ho = h2h.outcomes.find(o => o.name === gameOdds.home_team)?.price;
+        if (ao && ho) ctx += `  ML: ${g.away.team} ${ao > 0 ? '+' : ''}${ao} | ${g.home.team} ${ho > 0 ? '+' : ''}${ho}\n`;
       }
       if (total) {
-        const overLine = total.outcomes.find(o => o.name === 'Over');
-        ctx += `  Total: O/U ${overLine?.point} (Over ${overLine?.price > 0 ? '+' : ''}${overLine?.price})\n`;
+        const over = total.outcomes.find(o => o.name === 'Over');
+        if (over) ctx += `  O/U: ${over.point} (Over ${over.price > 0 ? '+' : ''}${over.price})\n`;
       }
     }
 
-    // Add pitcher stats
-    [g.away, g.home].forEach(side => {
-      if (!side.pitcher) { ctx += `  ${side.team} SP: TBD\n`; return; }
-      ctx += `  ${side.team} SP: ${side.pitcher.name}`;
-      const savant = savantData[side.pitcher.id];
-      if (savant) {
-        ctx += ` | Whiff% ${savant.whiffPct}% | Hard Hit% ${savant.hardHitPct}% | Avg Velo ${savant.avgVelo} mph`;
+    // Pitchers with Savant stats
+    [{ side: g.away, label: 'Away' }, { side: g.home, label: 'Home' }].forEach(({ side, label }) => {
+      if (!side.pitcher) { ctx += `  ${label} SP: TBD\n`; return; }
+      ctx += `  ${label} SP: ${side.pitcher.name}`;
+      const s = savantData[side.pitcher.id];
+      if (s && s.pitches > 0) {
+        ctx += ` | Whiff% ${s.whiffPct} | Hard Hit% ${s.hardHitPct} | Avg Velo ${s.avgVelo} mph`;
       }
       ctx += '\n';
     });
@@ -190,108 +206,129 @@ async function generatePost(context) {
     },
     body: JSON.stringify({
       model: 'claude-sonnet-4-5',
-      max_tokens: 1024,
-      system: `You are the content writer for MLBBetGPT, an AI MLB analytics platform on Instagram.
+      max_tokens: 800,
+      system: `You are the content writer for MLBBetGPT, an AI MLB analytics platform on Instagram and TikTok.
 
-Your job is to write ONE compelling Instagram post per day that:
-- Highlights an interesting analytical angle from tonight's MLB slate
-- Focuses on DATA and EDGES, never gives direct picks
-- Makes the reader curious enough to visit MLBBetGPT for deeper analysis
+Write ONE compelling post that:
+- Highlights a genuinely interesting analytical angle from tonight's slate
+- Focuses on DATA and EDGES — never gives direct picks or guarantees
+- Makes followers curious enough to visit MLBBetGPT for deeper analysis
+- Uses specific stats naturally (whiff rates, velocities, odds movement)
 - Feels like a sharp analyst sharing an insight, not a tipster
-- Uses relevant stats naturally (e.g. "Cole's whiff rate is top 5% in MLB this season")
-- Ends with a soft CTA to the app
 
-FORMAT your response as:
-HOOK: (first line — must stop the scroll, max 10 words)
-BODY: (2-4 lines of analytical insight with specific stats)
-CTA: (one line driving to the app)
-HASHTAGS: (8-10 relevant hashtags)
+FORMAT your response EXACTLY like this:
+HOOK: (first line — stops the scroll, max 10 words, use an emoji)
+BODY: (2-4 lines of sharp analytical insight with specific stats)
+CTA: Full breakdown at MLBBetGPT ⚾ (link in bio)
+HASHTAGS: #MLB #BaseballAnalytics #SportsBetting #MLBpicks #BaseballStats #BettingAnalysis #MLBToday #SportsbookEdge
 
 TONE: Confident, analytical, educational. Like a smart friend who knows baseball analytics.
-DO NOT: Give picks, guarantee outcomes, use "lock", "guaranteed", or claim win records.`,
+NEVER: Give picks, use "lock" or "guaranteed", claim win records, or encourage reckless betting.`,
       messages: [{
         role: 'user',
-        content: `Based on tonight's MLB data, generate one Instagram post that highlights the most interesting analytical angle:\n\n${context}`
+        content: `Generate today's post based on this data:\n\n${context}`
       }]
     })
   });
 
   const data = await res.json();
-  return data.content?.[0]?.text || 'Failed to generate post';
+  if (data.error) throw new Error('Claude API error: ' + data.error.message);
+  return data.content?.[0]?.text || '';
 }
 
-// ── STORE POST (Netlify Blobs) ──
-async function storePost(post, date) {
-  // Store in environment for retrieval by approve endpoint
-  // In production this would use Netlify Blobs or a simple DB
-  console.log('Post generated for', date, ':', post.slice(0, 100) + '...');
-}
+// ── PARSE POST INTO SECTIONS ──
+function parsePost(text) {
+  const lines = text.split('\n');
+  const sections = { hook: '', body: '', cta: '', hashtags: '', caption: '' };
+  const bodyLines = [];
+  let currentSection = null;
 
-// ── SEND APPROVAL EMAIL VIA SENDGRID ──
-async function sendApprovalEmail(post, date) {
-  const dateStr = new Date(date).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-
-  // Parse the post sections
-  const sections = parsePost(post);
-
-  const emailBody = `
-<!DOCTYPE html>
-<html>
-<body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #f5f5f5; padding: 20px;">
-  <div style="background: #0d1220; border-radius: 12px; padding: 30px; color: white;">
-    <h1 style="color: #c8102e; margin: 0 0 5px 0;">⚾ MLBBetGPT</h1>
-    <p style="color: rgba(255,255,255,0.5); margin: 0 0 25px 0;">Daily Content — ${dateStr}</p>
-
-    <div style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 20px; margin-bottom: 20px;">
-      <h3 style="color: #f59e0b; margin: 0 0 15px 0;">📱 Tonight's Instagram Post</h3>
-      <div style="white-space: pre-wrap; line-height: 1.7; color: #dde1ed;">${post}</div>
-    </div>
-
-    <div style="display: flex; gap: 12px; margin-top: 20px;">
-      <a href="${APPROVE_URL}?date=${date}&action=approve"
-         style="background: #22c55e; color: white; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px;">
-        ✅ Approve & Post
-      </a>
-      <a href="${APPROVE_URL}?date=${date}&action=regenerate"
-         style="background: #f59e0b; color: white; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px;">
-        🔄 Regenerate
-      </a>
-      <a href="${APPROVE_URL}?date=${date}&action=skip"
-         style="background: rgba(255,255,255,0.1); color: white; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px;">
-        ⏭ Skip Today
-      </a>
-    </div>
-  </div>
-
-  <p style="text-align: center; color: #999; font-size: 12px; margin-top: 15px;">
-    MLBBetGPT Daily Content Pipeline · For entertainment purposes only
-  </p>
-</body>
-</html>`;
-
-  const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${SENDGRID_API_KEY}`
-    },
-    body: JSON.stringify({
-      personalizations: [{ to: [{ email: APPROVAL_EMAIL }] }],
-      from: { email: 'content@mlbbetgpt.com', name: 'MLBBetGPT Content' },
-      subject: `⚾ MLBBetGPT Post Ready for Approval — ${dateStr}`,
-      content: [{ type: 'text/html', value: emailBody }]
-    })
+  lines.forEach(line => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('HOOK:')) {
+      currentSection = 'hook';
+      sections.hook = trimmed.replace('HOOK:', '').trim();
+    } else if (trimmed.startsWith('BODY:')) {
+      currentSection = 'body';
+      const val = trimmed.replace('BODY:', '').trim();
+      if (val) bodyLines.push(val);
+    } else if (trimmed.startsWith('CTA:')) {
+      currentSection = 'cta';
+      sections.cta = trimmed.replace('CTA:', '').trim();
+    } else if (trimmed.startsWith('HASHTAGS:')) {
+      currentSection = 'hashtags';
+      sections.hashtags = trimmed.replace('HASHTAGS:', '').trim();
+    } else if (currentSection === 'body' && trimmed) {
+      bodyLines.push(trimmed);
+    } else if (currentSection === 'hashtags' && trimmed) {
+      sections.hashtags += ' ' + trimmed;
+    }
   });
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`SendGrid error: ${err}`);
-  }
+  sections.body = bodyLines.join('\n');
+  sections.caption = `${sections.hook}\n\n${sections.body}\n\n${sections.cta}\n\n${sections.hashtags}`;
+  return sections;
+}
 
-  console.log('Approval email sent to', APPROVAL_EMAIL);
+// ── SCHEDULE TO BUFFER VIA GRAPHQL ──
+async function scheduleToBuffer(parsed, scheduleTime) {
+  const channels = [INSTAGRAM_CHANNEL_ID, TIKTOK_CHANNEL_ID];
+
+  const mutation = `
+    mutation CreatePost($input: CreatePostInput!) {
+      createPost(input: $input) {
+        post {
+          id
+          status
+          scheduledAt
+        }
+        errors {
+          message
+        }
+      }
+    }
+  `;
+
+  for (const channelId of channels) {
+    const variables = {
+      input: {
+        channelId,
+        content: { text: parsed.caption },
+        scheduledAt: scheduleTime
+      }
+    };
+
+    const res = await fetch('https://api.buffer.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${BUFFER_API_KEY}`
+      },
+      body: JSON.stringify({ query: mutation, variables })
+    });
+
+    const data = await res.json();
+
+    if (data.errors) {
+      console.error(`Buffer error for channel ${channelId}:`, JSON.stringify(data.errors));
+    } else if (data.data?.createPost?.errors?.length) {
+      console.error(`Buffer createPost errors:`, JSON.stringify(data.data.createPost.errors));
+    } else {
+      const post = data.data?.createPost?.post;
+      console.log(`Scheduled to ${channelId}:`, post?.id, 'at', post?.scheduledAt);
+    }
+  }
 }
 
 // ── HELPERS ──
+function getScheduleTime() {
+  const now = new Date();
+  const scheduled = new Date(now);
+  scheduled.setUTCHours(POST_HOUR_UTC, 0, 0, 0);
+  if (scheduled <= now) scheduled.setDate(scheduled.getDate() + 1);
+  return scheduled.toISOString();
+}
+
 function parseCSV(csv) {
   const lines = csv.trim().split('\n');
   if (lines.length < 2) return [];
@@ -304,19 +341,3 @@ function parseCSV(csv) {
   });
 }
 
-function avg(arr) {
-  if (!arr.length) return 0;
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-
-function parsePost(post) {
-  const sections = {};
-  const lines = post.split('\n');
-  lines.forEach(line => {
-    if (line.startsWith('HOOK:')) sections.hook = line.replace('HOOK:', '').trim();
-    if (line.startsWith('BODY:')) sections.body = line.replace('BODY:', '').trim();
-    if (line.startsWith('CTA:')) sections.cta = line.replace('CTA:', '').trim();
-    if (line.startsWith('HASHTAGS:')) sections.hashtags = line.replace('HASHTAGS:', '').trim();
-  });
-  return sections;
-}
