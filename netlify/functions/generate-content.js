@@ -1,12 +1,8 @@
-// MLBBetGPT Daily Content Generator
-// Runs every morning at 9am ET via cron
-// Pulls tonight's games, starters, Savant stats, odds
-// Generates Instagram post script via Claude
-// Emails to robrossshannon.betgpt@gmail.com for approval
-
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const BUFFER_API_KEY = process.env.BUFFER_API_KEY;
+const CREATOMATE_API_KEY = process.env.CREATOMATE_API_KEY;
+const CREATOMATE_TEMPLATE_ID = process.env.CREATOMATE_TEMPLATE_ID;
 
 const INSTAGRAM_CHANNEL_ID = '6a5297ba404834462896cabf';
 const TIKTOK_CHANNEL_ID = '6a5297ce404834462896cb0f';
@@ -40,9 +36,13 @@ exports.handler = async function(event) {
     const parsed = parsePost(post);
     console.log('Generated post hook:', parsed.hook);
 
-    // 6. Schedule to Buffer (Instagram + TikTok)
+    // 6. Render video via Creatomate
+    const videoUrl = await renderVideo(parsed, games, savantData, odds);
+    console.log('Video rendered:', videoUrl);
+
+    // 7. Schedule to Buffer (Instagram + TikTok)
     const scheduleTime = getScheduleTime();
-    await scheduleToBuffer(parsed, scheduleTime);
+    await scheduleToBuffer(parsed, scheduleTime, videoUrl);
 
     console.log('Content scheduled for', scheduleTime);
     return {
@@ -270,8 +270,98 @@ function parsePost(text) {
   return sections;
 }
 
+// ── RENDER VIDEO VIA CREATOMATE ──
+async function renderVideo(parsed, games, savantData, odds) {
+  // Find the featured game (first game with pitcher data)
+  let featuredGame = null;
+  let featuredSavant = null;
+  let featuredTotal = null;
+
+  for (const g of games) {
+    const awayS = g.away.pitcher ? savantData[g.away.pitcher.id] : null;
+    const homeS = g.home.pitcher ? savantData[g.home.pitcher.id] : null;
+    if (awayS || homeS) {
+      featuredGame = g;
+      featuredSavant = awayS || homeS;
+
+      // Find odds for this game
+      const gameOdds = (Array.isArray(odds) ? odds : []).find(o =>
+        o.away_team && g.away.team && (
+          o.away_team.includes(g.away.team.split(' ').pop()) ||
+          g.away.team.includes(o.away_team.split(' ').pop())
+        )
+      );
+      if (gameOdds) {
+        const total = gameOdds.bookmakers?.[0]?.markets?.find(m => m.key === 'totals');
+        const over = total?.outcomes?.find(o => o.name === 'Over');
+        if (over) featuredTotal = over.point.toString();
+      }
+      break;
+    }
+  }
+
+  const modifications = {
+    hook_text: parsed.hook || 'Tonight's MLB Analytics Edge',
+    stat1_value: featuredSavant?.whiffPct ? featuredSavant.whiffPct + '%' : 'N/A',
+    stat2_value: featuredSavant?.avgVelo ? featuredSavant.avgVelo + ' mph' : 'N/A',
+    stat3_value: featuredSavant?.hardHitPct ? featuredSavant.hardHitPct + '%' : 'N/A',
+    stat4_value: featuredTotal || 'N/A',
+    body_text: parsed.body || ''
+  };
+
+  console.log('Rendering video with modifications:', JSON.stringify(modifications));
+
+  const res = await fetch('https://api.creatomate.com/v1/renders', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${CREATOMATE_API_KEY}`
+    },
+    body: JSON.stringify({
+      template_id: CREATOMATE_TEMPLATE_ID,
+      modifications
+    })
+  });
+
+  const data = await res.json();
+  console.log('Creatomate response:', JSON.stringify(data));
+
+  if (!res.ok) throw new Error('Creatomate error: ' + JSON.stringify(data));
+
+  // Poll for completion (Creatomate renders async)
+  const renderId = Array.isArray(data) ? data[0]?.id : data?.id;
+  if (!renderId) throw new Error('No render ID returned from Creatomate');
+
+  return await pollRender(renderId);
+}
+
+// Poll Creatomate until render is complete
+async function pollRender(renderId) {
+  const maxAttempts = 30;
+  const delay = 3000; // 3 seconds between polls
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(resolve => setTimeout(resolve, delay));
+
+    const res = await fetch(`https://api.creatomate.com/v1/renders/${renderId}`, {
+      headers: { 'Authorization': `Bearer ${CREATOMATE_API_KEY}` }
+    });
+
+    const render = await res.json();
+    console.log(`Render status (attempt ${i+1}):`, render.status);
+
+    if (render.status === 'succeeded') {
+      return render.url;
+    } else if (render.status === 'failed') {
+      throw new Error('Creatomate render failed: ' + render.error_message);
+    }
+  }
+
+  throw new Error('Creatomate render timed out');
+}
+
 // ── SCHEDULE TO BUFFER VIA GRAPHQL ──
-async function scheduleToBuffer(parsed, scheduleTime) {
+async function scheduleToBuffer(parsed, scheduleTime, videoUrl) {
   const channels = [INSTAGRAM_CHANNEL_ID, TIKTOK_CHANNEL_ID];
 
   const mutation = `
@@ -292,6 +382,15 @@ async function scheduleToBuffer(parsed, scheduleTime) {
   `;
 
   for (const channelId of channels) {
+    // Build assets array with video if available
+    const assets = videoUrl ? [
+      {
+        video: {
+          url: videoUrl
+        }
+      }
+    ] : [];
+
     const variables = {
       input: {
         channelId,
@@ -299,7 +398,7 @@ async function scheduleToBuffer(parsed, scheduleTime) {
         schedulingType: 'automatic',
         mode: 'customScheduled',
         dueAt: scheduleTime,
-        assets: []
+        assets
       }
     };
 
