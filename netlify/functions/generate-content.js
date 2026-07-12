@@ -301,7 +301,7 @@ async function renderVideo(parsed, games, savantData, odds) {
   }
 
   const modifications = {
-    hook_text: parsed.hook || 'Tonight's MLB Analytics Edge',
+    hook_text: parsed.hook || 'Tonight MLB Analytics Edge',
     stat1_value: featuredSavant?.whiffPct ? featuredSavant.whiffPct + '%' : 'N/A',
     stat2_value: featuredSavant?.avgVelo ? featuredSavant.avgVelo + ' mph' : 'N/A',
     stat3_value: featuredSavant?.hardHitPct ? featuredSavant.hardHitPct + '%' : 'N/A',
