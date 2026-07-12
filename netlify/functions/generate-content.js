@@ -348,4 +348,5 @@ function parseCSV(csv) {
     return obj;
   });
 }
+}
 
