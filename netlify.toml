@@ -2,4 +2,4 @@
   functions = "netlify/functions"
 
 [functions."generate-content"]
-  schedule = "0 14 * * *"
+  timeout = 300
